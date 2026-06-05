@@ -1,0 +1,60 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-dota-bg text-dota-text antialiased;
+    background-image:
+      radial-gradient(circle at 15% 0%, rgba(200, 57, 44, 0.10), transparent 40%),
+      radial-gradient(circle at 85% 100%, rgba(200, 168, 87, 0.08), transparent 45%);
+    background-attachment: fixed;
+  }
+  h1, h2, h3 {
+    @apply font-display tracking-wide;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply bg-dota-panel border border-dota-border rounded-lg;
+  }
+  .panel-glow {
+    @apply panel shadow-glow;
+  }
+  .stat-label {
+    @apply text-xs uppercase tracking-widest text-dota-muted;
+  }
+  .stat-value {
+    @apply text-2xl font-display font-semibold text-dota-text;
+  }
+  .btn-primary {
+    @apply bg-dota-red hover:bg-dota-redHover text-white font-display font-semibold
+           uppercase tracking-wider px-6 py-3 rounded-md transition-colors
+           disabled:opacity-50 disabled:cursor-not-allowed shadow-redGlow;
+  }
+  .input-dark {
+    @apply bg-dota-panel2 border border-dota-border focus:border-dota-gold
+           text-dota-text placeholder:text-dota-muted px-4 py-3 rounded-md
+           outline-none transition-colors w-full;
+  }
+}
+
+/* Subtle scrollbar */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: #0e1014;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a3142;
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3a4358;
+}
