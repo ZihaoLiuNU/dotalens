@@ -3,7 +3,8 @@ package com.dotalens.dotaanalyszer.model;
 import com.fasterxml.jackson.annotation.JsonInclude;
 
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class AnalysisResponse {
+public class
+AnalysisResponse {
     private PlayerSnapshot snapshot;
     private AnalysisResult analysis;
     private String analysisError;

@@ -33,6 +33,9 @@ public class PlayerSnapshot {
     private ModeStats turbo;
     private ModeStats normal;
 
+    // true when served from last-known-good fallback because OpenDota was unavailable
+    private boolean stale;
+
     public long getSteamId() { return steamId; }
     public void setSteamId(long steamId) { this.steamId = steamId; }
     public String getPersonaName() { return personaName; }
@@ -77,4 +80,6 @@ public class PlayerSnapshot {
     public void setTurbo(ModeStats turbo) { this.turbo = turbo; }
     public ModeStats getNormal() { return normal; }
     public void setNormal(ModeStats normal) { this.normal = normal; }
+    public boolean isStale() { return stale; }
+    public void setStale(boolean stale) { this.stale = stale; }
 }

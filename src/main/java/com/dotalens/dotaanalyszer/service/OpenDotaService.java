@@ -7,6 +7,10 @@ import com.dotalens.dotaanalyszer.model.MatchPlayer;
 import com.dotalens.dotaanalyszer.model.MatchSummary;
 import com.dotalens.dotaanalyszer.model.ModeStats;
 import com.dotalens.dotaanalyszer.model.PlayerSnapshot;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.retry.Retry;
+import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -16,7 +20,14 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 @Service
 public class OpenDotaService {
@@ -25,6 +36,21 @@ public class OpenDotaService {
 
     private final RestClient restClient;
     private final String baseUrl;
+    private final CircuitBreaker circuitBreaker;
+    private final Retry retry;
+
+    // Last-known-good snapshot per player, used to degrade gracefully when OpenDota is down.
+    private final Map<Long, PlayerSnapshot> lastGoodSnapshot = new ConcurrentHashMap<>();
+
+    // buildSnapshot() fires ~11 independent OpenDota GETs; run them concurrently instead of one
+    // at a time so total wall-clock time is bounded by the slowest call, not their sum.
+    private final ExecutorService executor = Executors.newFixedThreadPool(12,
+            r -> { Thread t = new Thread(r, "opendota-fetch"); t.setDaemon(true); return t; });
+
+    @PreDestroy
+    public void shutdown() {
+        executor.shutdown();
+    }
 
     private static final Map<Integer, String> LOBBY_TYPES = Map.ofEntries(
             Map.entry(-1, "Invalid"), Map.entry(0, "Normal"), Map.entry(1, "Practice"),
@@ -40,21 +66,78 @@ public class OpenDotaService {
             Map.entry(22, "All Draft Ranked"), Map.entry(23, "Turbo")
     );
 
-    public OpenDotaService(RestClient restClient,
-                           @Value("${opendota.base-url}") String baseUrl) {
-        this.restClient = restClient;
-        this.baseUrl = baseUrl;
+    private enum ModeKey {
+        RANKED("lobby_type=7", ms -> "Ranked".equals(ms.getLobbyType()) && !"Turbo".equals(ms.getGameMode())),
+        TURBO("significant=0&game_mode=23", ms -> "Turbo".equals(ms.getGameMode())),
+        NORMAL("lobby_type=0", ms -> !"Ranked".equals(ms.getLobbyType()) && !"Turbo".equals(ms.getGameMode()));
+
+        final String filter;
+        final Predicate<MatchSummary> matcher;
+
+        ModeKey(String filter, Predicate<MatchSummary> matcher) {
+            this.filter = filter;
+            this.matcher = matcher;
+        }
     }
 
-    @Cacheable(value = "snapshot", key = "#steamId")
+    public OpenDotaService(RestClient restClient,
+                           @Value("${opendota.base-url}") String baseUrl,
+                           CircuitBreaker openDotaCircuitBreaker,
+                           Retry openDotaRetry) {
+        this.restClient = restClient;
+        this.baseUrl = baseUrl;
+        this.circuitBreaker = openDotaCircuitBreaker;
+        this.retry = openDotaRetry;
+    }
+
+    // Don't cache a stale fallback as if it were fresh — it must be re-attempted once OpenDota recovers.
+    @Cacheable(value = "snapshot", key = "#steamId", unless = "#result != null && #result.stale")
     public PlayerSnapshot buildSnapshot(long steamId) {
+        // Fail fast: if the circuit is already OPEN, don't fire ~8 doomed calls — serve last-known-good.
+        if (circuitBreaker.getState() == CircuitBreaker.State.OPEN) {
+            PlayerSnapshot stale = lastGoodSnapshot.get(steamId);
+            if (stale != null) {
+                log.warn("OpenDota circuit OPEN — serving STALE snapshot for steamId={}", steamId);
+                stale.setStale(true);
+                return stale;
+            }
+            throw new IllegalStateException("OpenDota is temporarily unavailable, please retry shortly");
+        }
+
         log.info("Building snapshot for steamId={}", steamId);
 
-        Map<String, Object> profileResp = getJson("/players/" + steamId);
-        Map<String, Object> wl = getJson("/players/" + steamId + "/wl?significant=0");
-        List<Map<String, Object>> recent = getJsonList("/players/" + steamId + "/recentMatches");
-        List<Map<String, Object>> heroes = getJsonList("/players/" + steamId + "/heroes?significant=0");
-        Map<Integer, String> heroIdToName = getHeroNameMap();
+        // Every GET below is independent of the others, so fan them all out at once instead of
+        // waiting on them one by one — total time becomes ~the slowest call, not their sum.
+        CompletableFuture<Map<String, Object>> profileFut =
+                CompletableFuture.supplyAsync(() -> getJson("/players/" + steamId), executor);
+        CompletableFuture<Map<String, Object>> wlFut =
+                CompletableFuture.supplyAsync(() -> getJson("/players/" + steamId + "/wl?significant=0"), executor);
+        CompletableFuture<List<Map<String, Object>>> recentFut =
+                CompletableFuture.supplyAsync(() -> getJsonList("/players/" + steamId + "/recentMatches"), executor);
+        CompletableFuture<List<Map<String, Object>>> heroesFut =
+                CompletableFuture.supplyAsync(() -> getJsonList("/players/" + steamId + "/heroes?significant=0"), executor);
+        CompletableFuture<Map<Integer, String>> heroNameFut =
+                CompletableFuture.supplyAsync(this::getHeroNameMap, executor);
+
+        Map<ModeKey, CompletableFuture<Map<String, Object>>> modeWlFuts = new EnumMap<>(ModeKey.class);
+        Map<ModeKey, CompletableFuture<List<Map<String, Object>>>> modeHeroesFuts = new EnumMap<>(ModeKey.class);
+        for (ModeKey mode : ModeKey.values()) {
+            modeWlFuts.put(mode, CompletableFuture.supplyAsync(
+                    () -> getJson("/players/" + steamId + "/wl?" + mode.filter), executor));
+            modeHeroesFuts.put(mode, CompletableFuture.supplyAsync(
+                    () -> getJsonList("/players/" + steamId + "/heroes?" + mode.filter), executor));
+        }
+
+        CompletableFuture.allOf(Stream.concat(
+                Stream.of(profileFut, wlFut, recentFut, heroesFut, heroNameFut),
+                Stream.concat(modeWlFuts.values().stream(), modeHeroesFuts.values().stream())
+        ).toArray(CompletableFuture[]::new)).join();
+
+        Map<String, Object> profileResp = profileFut.join();
+        Map<String, Object> wl = wlFut.join();
+        List<Map<String, Object>> recent = recentFut.join();
+        List<Map<String, Object>> heroes = heroesFut.join();
+        Map<Integer, String> heroIdToName = heroNameFut.join();
 
         PlayerSnapshot s = new PlayerSnapshot();
         s.setSteamId(steamId);
@@ -134,31 +217,34 @@ public class OpenDotaService {
                 .collect(Collectors.toList());
         s.setTopHeroes(topHeroes);
 
-        // per-mode breakdowns
-        s.setRanked(buildModeStats(steamId, "lobby_type=7",
-                summaries.stream()
-                        .filter(ms -> "Ranked".equals(ms.getLobbyType()) && !"Turbo".equals(ms.getGameMode()))
-                        .collect(Collectors.toList()),
-                heroIdToName));
-        s.setTurbo(buildModeStats(steamId, "significant=0&game_mode=23",
-                summaries.stream()
-                        .filter(ms -> "Turbo".equals(ms.getGameMode()))
-                        .collect(Collectors.toList()),
-                heroIdToName));
-        s.setNormal(buildModeStats(steamId, "lobby_type=0",
-                summaries.stream()
-                        .filter(ms -> !"Ranked".equals(ms.getLobbyType()) && !"Turbo".equals(ms.getGameMode()))
-                        .collect(Collectors.toList()),
-                heroIdToName));
+        // per-mode breakdowns — the wl/heroes calls for each mode were already fetched above
+        for (ModeKey mode : ModeKey.values()) {
+            List<MatchSummary> recentInMode = summaries.stream()
+                    .filter(mode.matcher)
+                    .collect(Collectors.toList());
+            ModeStats stats = buildModeStats(modeWlFuts.get(mode).join(), modeHeroesFuts.get(mode).join(),
+                    recentInMode, heroIdToName);
+            switch (mode) {
+                case RANKED -> s.setRanked(stats);
+                case TURBO -> s.setTurbo(stats);
+                case NORMAL -> s.setNormal(stats);
+            }
+        }
+
+        // Remember the last healthy result so we can degrade gracefully if OpenDota later goes down.
+        boolean healthy = s.getPersonaName() != null
+                || (s.getRecentMatches() != null && !s.getRecentMatches().isEmpty());
+        if (healthy) {
+            s.setStale(false);
+            lastGoodSnapshot.put(steamId, s);
+        }
 
         return s;
     }
 
-    private ModeStats buildModeStats(long steamId, String filter, List<MatchSummary> recentInMode,
-                                     Map<Integer, String> heroIdToName) {
+    private ModeStats buildModeStats(Map<String, Object> wl, List<Map<String, Object>> heroes,
+                                     List<MatchSummary> recentInMode, Map<Integer, String> heroIdToName) {
         ModeStats m = new ModeStats();
-        Map<String, Object> wl = getJson("/players/" + steamId + "/wl?" + filter);
-        List<Map<String, Object>> heroes = getJsonList("/players/" + steamId + "/heroes?" + filter);
 
         int wins = asInt(wl.get("win"), 0);
         int losses = asInt(wl.get("lose"), 0);
@@ -273,9 +359,9 @@ public class OpenDotaService {
                     int wins = asInt(m.get("wins"), 0);
                     double wr = games == 0 ? 0.0 : round2((double) wins / games * 100.0);
                     // disadvantage = 50 - winRate of this hero vs us (i.e. how much they hurt us)
-                    double disadv = round2(50.0 - wr);
+                    double disadvantage = round2(50.0 - wr);
                     return new HeroMatchup(hid, heroIdToName.getOrDefault(hid, "Hero " + hid),
-                            games, wins, wr, disadv);
+                            games, wins, wr, disadvantage);
                 })
                 .filter(h -> h.getGamesPlayed() >= 50)
                 .sorted(Comparator.comparingDouble(HeroMatchup::getDisadvantage).reversed())
@@ -296,28 +382,46 @@ public class OpenDotaService {
 
     private Map<String, Object> getJson(String path) {
         try {
-            Map<String, Object> body = restClient.get()
+            Map<String, Object> body = callOpenDota(path, () -> restClient.get()
                     .uri(baseUrl + path)
                     .retrieve()
-                    .body(new ParameterizedTypeReference<Map<String, Object>>() {});
+                    .body(new ParameterizedTypeReference<Map<String, Object>>() {}));
             return body == null ? Map.of() : body;
+        } catch (CallNotPermittedException e) {
+            log.warn("OpenDota circuit OPEN — skipping GET {} (fail fast)", path);
+            return Map.of();
         } catch (Exception e) {
-            log.warn("OpenDota GET {} failed: {}", path, e.getMessage());
+            log.warn("OpenDota GET {} failed after retries: {}", path, e.getMessage());
             return Map.of();
         }
     }
 
     private List<Map<String, Object>> getJsonList(String path) {
         try {
-            List<Map<String, Object>> body = restClient.get()
+            List<Map<String, Object>> body = callOpenDota(path, () -> restClient.get()
                     .uri(baseUrl + path)
                     .retrieve()
-                    .body(new ParameterizedTypeReference<List<Map<String, Object>>>() {});
+                    .body(new ParameterizedTypeReference<List<Map<String, Object>>>() {}));
             return body == null ? List.of() : body;
+        } catch (CallNotPermittedException e) {
+            log.warn("OpenDota circuit OPEN — skipping GET {} (fail fast)", path);
+            return List.of();
         } catch (Exception e) {
-            log.warn("OpenDota GET {} failed: {}", path, e.getMessage());
+            log.warn("OpenDota GET {} failed after retries: {}", path, e.getMessage());
             return List.of();
         }
+    }
+
+    /**
+     * Wrap one OpenDota HTTP call with resilience at the external boundary:
+     * CircuitBreaker(Retry(call)). Retry smooths over transient blips; the circuit breaker
+     * trips after a sustained failure/slow rate and then fails fast (CallNotPermittedException)
+     * so we neither hammer a struggling dependency nor pile up blocked threads.
+     */
+    private <T> T callOpenDota(String path, Supplier<T> call) {
+        Supplier<T> withRetry = Retry.decorateSupplier(retry, call);
+        Supplier<T> withCircuitBreaker = CircuitBreaker.decorateSupplier(circuitBreaker, withRetry);
+        return withCircuitBreaker.get();
     }
 
     private static Map<String, Object> asMap(Object o) {

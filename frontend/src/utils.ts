@@ -1,18 +1,48 @@
 const STEAM64_OFFSET = 76561197960265728n;
 
-export function normalizeSteamId(input: string): string {
-  const trimmed = input.trim();
-  if (!/^\d+$/.test(trimmed)) return trimmed;
-  if (trimmed.length >= 17 && trimmed.startsWith('7656119')) {
-    try {
-      const id64 = BigInt(trimmed);
-      const id32 = id64 - STEAM64_OFFSET;
-      if (id32 > 0n) return id32.toString();
-    } catch {
-      return trimmed;
-    }
+function steam64ToSteam32(id64Str: string): string | null {
+  try {
+    const id64 = BigInt(id64Str);
+    const id32 = id64 - STEAM64_OFFSET;
+    if (id32 > 0n) return id32.toString();
+  } catch {
+    // not a valid bigint
   }
-  return trimmed;
+  return null;
+}
+
+export function isVanityUrl(input: string): boolean {
+  return /steamcommunity\.com\/id\/[^/?#]+/i.test(input.trim());
+}
+
+export function normalizeSteamId(input: string): string {
+  const s = input.trim();
+
+  // Steam community profile URL: /profiles/{steam64}
+  const profileMatch = s.match(/\/profiles\/(\d{17,})/);
+  if (profileMatch) {
+    return steam64ToSteam32(profileMatch[1]) ?? profileMatch[1];
+  }
+
+  // OpenDota / Dotabuff URL: /players/{id}
+  const playerMatch = s.match(/\/players\/(\d+)/);
+  if (playerMatch) {
+    const id = playerMatch[1];
+    if (id.length >= 17 && id.startsWith('7656119')) {
+      return steam64ToSteam32(id) ?? id;
+    }
+    return id;
+  }
+
+  // Bare numeric ID — convert if Steam64-shaped
+  if (/^\d+$/.test(s)) {
+    if (s.length >= 17 && s.startsWith('7656119')) {
+      return steam64ToSteam32(s) ?? s;
+    }
+    return s;
+  }
+
+  return s;
 }
 
 export function formatDuration(seconds: number): string {
